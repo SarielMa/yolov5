@@ -156,9 +156,9 @@ def pgd_attack(net, img, gt, noise_norm, norm_type, max_iter, step, loss_fn,
         Xn = Xn.detach()
         Xn.requires_grad=True    
         #--------------------------------------------------------
-        with torch.enable_grad(): ##this is super straige!!!! without this, Xn cannot get grad though any computing. why ??????
+        with torch.enable_grad(): ##this is super strange!!!! without this, Xn cannot get grad though any computing. why ??????
             out, train_out = net(Xn)
-            loss = loss_fn([x.float() for x in train_out], gt)[0]
+        loss = loss_fn([x.float() for x in train_out], gt)[0]
         #---------------------------
         if targeted == True:
             loss=-loss
@@ -338,7 +338,7 @@ def run(data,
         dt[0] += t2 - t1
         
         # adversarial attack
-        noise = 0.0
+        noise = 0.1
         if noise>0:
             max_iter = 100
             step = 5*noise/max_iter
