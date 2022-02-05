@@ -44,7 +44,7 @@ from models.yolo import Model
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
-from utils.datasets import create_dataloader
+from utils.datasets import my_create_dataloader, create_dataloader
 from utils.downloads import attempt_download
 from utils.general import (LOGGER, check_dataset, check_file, check_git_status, check_img_size, check_requirements,
                            check_suffix, check_yaml, colorstr, get_latest_run, increment_path, init_seeds,
@@ -52,7 +52,7 @@ from utils.general import (LOGGER, check_dataset, check_file, check_git_status, 
                            print_args, print_mutation, strip_optimizer)
 from utils.loggers import Loggers
 from utils.loggers.wandb.wandb_utils import check_wandb_resume
-from utils.loss import ComputeLoss
+from utils.loss import MyComputeLoss, ComputeLoss
 from utils.metrics import fitness
 from utils.plots import plot_evolve, plot_labels
 from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_device, torch_distributed_zero_first
@@ -73,10 +73,8 @@ def IMA_update_margin(E, delta, max_margin, flag1, flag2, margin_new):
     # flag1, flag2, margin_new: from IMA_check_margin
     expand=(flag1==1)&(flag2==1)
     no_expand=(flag1==0)&(flag2==1)
-    E[expand]+=delta
-    E[no_expand]=margin_new[no_expand]
-    #when wrongly classified, do not re-initialize
-    E[flag2==0]=delta
+    E[expand]+=delta #expand
+    E[no_expand]=margin_new[no_expand]# refine
     E.clamp_(min=0, max=max_margin)
     print (expand.sum().item(),"samples are expanded.....")
 
@@ -93,7 +91,7 @@ def pgd_attack(net, img, gt,
                stop_if_label_change=False,
                stop_if_label_change_next_step=False,
                use_optimizer=False,
-               run_model=None, classify_model_output=None,               
+               get_loss=None, classify_model_output=None,               
                model_eval_attack=False):
     #-------------------------------------------
     train_mode=net.training# record the mode
@@ -112,7 +110,7 @@ def pgd_attack(net, img, gt,
     #-----------------
     Xn1=img.detach().clone()
     Xn2=img.detach().clone()
-    Ypn_old_e_Y=torch.ones(gt.shape[0], dtype=torch.bool, device=gt.device)
+    Ypn_old_e_Y=torch.ones(img.shape[0], dtype=torch.bool, device=gt.device)
     Ypn_old_ne_Y=~Ypn_old_e_Y
     #-----------------
     noise=(Xn-img).detach()
@@ -123,21 +121,17 @@ def pgd_attack(net, img, gt,
         Xn.requires_grad = True  
         # run the model and get pred result
         
-        pred, loss=run_model(net, Xn, gt, return_loss=True, reduction='sum')
+        #pred, loss=run_model(net, Xn, gt, return_loss=True, reduction='sum')
+        train_out = net(Xn)
+        loss, l1, l2, l3 = get_loss(train_out, gt)
         #========================================
-        Ypn_e_Y=classify_model_output(pred, gt)
+        Ypn_e_Y=classify_model_output(l1, l2, l3)
         Ypn_ne_Y=~Ypn_e_Y
         #---------------------------
-        #targeted attack, Y should be filled with targeted output
-        if targeted == False:
-            A=Ypn_e_Y
-            A_old=Ypn_old_e_Y
-            B=Ypn_ne_Y
-        else:
-            A=Ypn_ne_Y
-            A_old=Ypn_old_ne_Y
-            B=Ypn_e_Y
-            loss=-loss
+        A=Ypn_ne_Y
+        A_old=Ypn_old_ne_Y
+        B=Ypn_e_Y
+        loss=-loss
         #---------------------------
         temp1=(A&A_old)&(advc<1)
         #temp1=(A&A_old)
@@ -153,7 +147,7 @@ def pgd_attack(net, img, gt,
         #---------------------------
         if n < max_iter:
             #loss.backward() will update W.grad
-            grad_n=torch.autograd.grad(loss, Xn)[0]
+            grad_n=torch.autograd.grad(loss.sum(), Xn)[0]
             grad_n=normalize_grad_(grad_n, norm_type)
 
             Xnew = Xn + step*grad_n
@@ -175,7 +169,7 @@ def pgd_attack(net, img, gt,
     if stop_near_boundary == True:
         temp=advc>0
         if temp.sum()>0:
-            Xn_out=refine_Xn_onto_boundary(net, Xn1, Xn2, gt, refine_Xn_max_iter, run_model, classify_model_output)
+            Xn_out=refine_Xn_onto_boundary(net, Xn1, Xn2, gt, refine_Xn_max_iter, get_loss, classify_model_output)
     #---------------------------
     if train_mode == True and net.training == False:
         net.train()
@@ -188,8 +182,10 @@ def refine_onto_boundary(net, Xn1, Xn2, gt, max_iter, run_model, classify_model_
     with torch.no_grad():
         Xn=(Xn1+Xn2)/2
         for k in range(0, max_iter):
-            pred =run_model(net, Xn, gt, return_loss=False)            
-            Ypn_e_Y=classify_model_output(pred, gt)
+            #pred =run_model(net, Xn, gt, return_loss=False)
+            train_out = net(Xn)
+            loss, l1, l2, l3 = run_model(train_out, gt)            
+            Ypn_e_Y=classify_model_output(l1,l2,l3)
             Ypn_ne_Y=~Ypn_e_Y
             Xn1[Ypn_e_Y]=Xn[Ypn_e_Y]
             Xn2[Ypn_ne_Y]=Xn[Ypn_ne_Y]
@@ -200,16 +196,8 @@ def refine_Xn_onto_boundary(net, Xn1, Xn2, gt, max_iter, run_model, classify_mod
 #note: Xn1 and Xn2 will be modified
     Xn, Xn1, Xn2=refine_onto_boundary(net, Xn1, Xn2, gt, max_iter, run_model, classify_model_output)
     return Xn
-#%%
-def refine_Xn1_onto_boundary(model, Xn1, Xn2, Y, max_iter, run_model, classify_model_output):
-#note: Xn1 and Xn2 will be modified
-    Xn, Xn1, Xn2=refine_onto_boundary(model, Xn1, Xn2, Y, max_iter, run_model, classify_model_output)
-    return Xn1
-#%%
-def refine_Xn2_onto_boundary(model, Xn1, Xn2, Y, max_iter, run_model, classify_model_output):
-#note: Xn1 and Xn2 will be modified
-    Xn, Xn1, Xn2=refine_onto_boundary(model, Xn1, Xn2, Y, max_iter, run_model, classify_model_output)
-    return Xn2
+
+
 #%%
 
 def repeated_pgd_attack(net, img, gt, 
@@ -253,7 +241,7 @@ def repeated_pgd_attack(net, img, gt,
 def IMA_loss(net, img, gt, 
              margin, norm_type, max_iter, step,
              rand_init_norm=None, rand_init_Xn=None,
-             clip_X_min=-1, clip_X_max=1,
+             clip_X_min=0, clip_X_max=1,
              refine_Xn_max_iter=10,
              Xn1_equal_X=False,
              Xn2_equal_Xn=False,
@@ -263,16 +251,17 @@ def IMA_loss(net, img, gt,
              beta=0.5, beta_position=1,
              use_optimizer = False,
              pgd_num_repeats=1,
-             run_model_std=None, classify_model_std_output=None,
-             run_model_adv=None, classify_model_adv_output=None
+             get_loss=None,
+             classify_model_std_output=None, classify_model_adv_output=None
              ):
     #----------------------------------
     if isinstance(step, torch.Tensor):
         temp=tuple([1]*len(img[0].size()))
         step=step.view(-1, *temp)
     #-----------------------------------
-    pred, loss_X=run_model_std(net, img, gt,return_loss=True)
-    Yp_e_Y=classify_model_std_output(pred, gt)
+    train_out = net(img)
+    loss_X, l1, l2, l3 = get_loss(train_out, gt)
+    Yp_e_Y=classify_model_std_output(l1, l2, l3)
     Yp_ne_Y=~Yp_e_Y 
     #-----------------------------------
     loss1=torch.tensor(0.0, dtype=img.dtype, device=img.device, requires_grad=True)
@@ -291,9 +280,9 @@ def IMA_loss(net, img, gt,
     #---------------------------------
     train_mode=net.training# record the mode
     #---------------------------------
-    # we ingore the re_initial, there is no need to use enable_loss3
-    
+    # we ingore the re_initial, there is no need to use enable_loss3 
     enable_loss3=False
+    
     if Yp_e_Y.sum().item()>0 and beta>0:
          enable_loss3=True
     
@@ -312,7 +301,7 @@ def IMA_loss(net, img, gt,
                                                stop_if_label_change=stop_if_label_change,
                                                stop_if_label_change_next_step=stop_if_label_change_next_step,
                                                use_optimizer=use_optimizer,
-                                               run_model=run_model_adv, classify_model_output=classify_model_adv_output,
+                                               run_model=get_loss, classify_model_output=classify_model_adv_output,
                                                num_repeats=pgd_num_repeats)
         #--------------------------------------------
     
@@ -320,7 +309,9 @@ def IMA_loss(net, img, gt,
             net.train()
         #--------------------------------------------
         idx_n=torch.arange(0,img.size(0))[Yp_e_Y]
-        pred, loss_Xn=run_model_std(net, Xn, gt,return_loss=True)
+        #pred, loss_Xn=run_model_std(net, Xn, gt,return_loss=True)
+        train_outn = net(Xn)
+        loss_Xn,_,_,_ = get_loss(train_outn, gt)
         Xn=Xn[idx_n]
         if idx_n.size(0)>0:   
             loss3 = loss_Xn[idx_n].sum()/Xn.size(0)
@@ -339,7 +330,7 @@ def IMA_loss(net, img, gt,
     if train_mode == True and net.training == False:
         net.train()
     #--------------------------------------------
-    return loss, pred, advc, Xn, Ypn, idx_n
+    return loss, Yp_e_Y, advc, Xn, idx_n
 
 
 #%% pgd section
@@ -427,37 +418,20 @@ def get_noise_init(norm_type, noise_norm, init_norm, X):
 
 #%%
 
-def run_model_std_reg(net, img, gt, return_loss=False, reduction='none'):
-    out, train_out = net(img)
-    
-    if return_loss == True:
-        loss, _=total_loss(train_out, gt, reduction = reduction)       
-        return train_out, loss
-    else:
-        return train_out
-#
-def run_model_adv_reg(net, img, gt, return_loss=False, reduction='none'):
-    out, train_out = net(img)
-    
-    if return_loss == True:
-        loss, _=total_loss(train_out, gt, reduction = reduction)       
-        return train_out, loss
-    else:
-        return train_out
-#
-def classify_model_std_output_reg(pred, gt):
-    threshold1 = 10000000000
 
-    loss, _=total_loss(train_out, gt, reduction = reduction) 
-    Yp_e_Y=(loss<=threshold1) 
-    #Yp_e_Y=(r>=threshold1) & (ry <=threshold2) & (rx <= threshold3)
+#
+def classify_model_std_output_reg(l1, l2, l3):
+    t1 = 10000000000
+    t2 = 10000000000
+    t3 = 10000000000
+    Yp_e_Y=(l1<=t1)&(l2<=t2)&(l3<=t3)
     return Yp_e_Y
 #
-def classify_model_adv_output_reg(pred, gt):
-    threshold1 = 0.14272124373274836
-    loss, _=total_loss(train_out, gt, reduction = reduction) 
-    #Yp_e_Y=(r>=threshold1) & (ry <=threshold2) & (rx <= threshold3)
-    Yp_e_Y=(loss<=threshold1) 
+def classify_model_adv_output_reg(l1, l2, l3):
+    t1 = 0.4
+    t2 = 1
+    t3 = 1
+    Yp_e_Y=(l1<=t1)&(l2<=t2)&(l3<=t3)
     return Yp_e_Y
 
 #%% training part of yolov5
@@ -676,7 +650,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
     stopper = EarlyStopping(patience=opt.patience)
-    compute_loss = ComputeLoss(model)  # init loss class
+    compute_loss = MyComputeLoss(model)  # init loss class
+    val_compute_loss = ComputeLoss(model)
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
@@ -699,7 +674,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         stop_if_label_change_next_step=True  
     #======================
     
-    sample_count_train = 150
+    sample_count_train = len(dataset)
     noise = 0.01
     epoch_refine = 100
     delta = 10*noise/epoch_refine
@@ -746,7 +721,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         for i, (imgs, targets, paths, _, idx) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-
+            idx = torch.tensor(idx)
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
@@ -776,7 +751,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
                 #pred1 = model(imgs)  # forward
                 #loss1, loss1_items = compute_loss(pred1, targets.to(device))  # loss scaled by batch_size
-                loss, pred, advc, Xn ,Ypn, idx_n = IMA_loss(model.model, imgs, targets.to(device),
+                loss, Yp_e_Y, advc, Xn, idx_n = IMA_loss(model, imgs, targets.to(device),
                                                         norm_type= norm_type,
                                                         rand_init_norm=rand_init_norm,
                                                         margin=margin,
@@ -790,9 +765,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                                         stop_if_label_change_next_step=stop_if_label_change_next_step,
                                                         beta=0.5, beta_position=1,
                                                         use_optimizer=False,                                                
-                                                        run_model_std=run_model_std_reg,
-                                                        classify_model_std_output=classify_model_std_output_reg,
-                                                        run_model_adv=run_model_adv_reg,
+                                                        get_loss=compute_loss.get_loss,
+                                                        classify_model_std_output=classify_model_std_output_reg,                                                       
                                                         classify_model_adv_output=classify_model_adv_output_reg)               
 
                 if RANK != -1:
@@ -812,7 +786,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     ema.update(model)
                 last_opt_step = ni
          #--------------------update the margins
-            Yp_e_Y=classify_model_std_output_reg(pred, targets)
+            #Yp_e_Y=classify_model_std_output_reg(pred, targets)
             flag1[idx[advc==0]]=1
             flag2[idx[Yp_e_Y]]=1
             #flag2[idx]=1
@@ -822,7 +796,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 #bottom = args.delta*torch.ones(E_new.size(0), dtype=E_new.dtype, device=E_new.device)
                 E_new[idx[idx_n]] = torch.max((E_new[idx[idx_n]]+temp)/2, bottom[idx[idx_n]])# use mean to refine the margin to reduce the effect of augmentation on margins
         #-----------------------------------------------------------------------
-
+            IMA_update_margin(E, delta, noise, flag1, flag2, E_new)
 
 
 
@@ -920,7 +894,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                             verbose=True,
                                             plots=True,
                                             callbacks=callbacks,
-                                            compute_loss=compute_loss)  # val best model with plots
+                                            compute_loss=val_compute_loss)  # val best model with plots
                     if is_coco:
                         callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
 
@@ -937,7 +911,7 @@ def parse_opt(known=False):
     parser.add_argument('--cfg', type=str, default='models/yolov5s.yaml', help='model.yaml path')
     parser.add_argument('--data', type=str, default=ROOT / 'data/bcc.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch.yaml', help='hyperparameters path')
-    parser.add_argument('--epochs', type=int, default=300)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch-size', type=int, default=32, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=320, help='train, val image size (pixels)')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
