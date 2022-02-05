@@ -428,9 +428,9 @@ def classify_model_std_output_reg(l1, l2, l3):
     return Yp_e_Y
 #
 def classify_model_adv_output_reg(l1, l2, l3):
-    t1 = 0.4
-    t2 = 1
-    t3 = 1
+    t1 = 0.016733793920832067
+    t2 = 0.04916848624661529
+    t3 = 0.010525250147504777
     Yp_e_Y=(l1<=t1)&(l2<=t2)&(l3<=t3)
     return Yp_e_Y
 
@@ -662,7 +662,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     #IMA parameters
     #net.zero_grad()
     #......................................................................................................
-    stop = 1
+    stop = 0
     stop_near_boundary=False
     stop_if_label_change=False
     stop_if_label_change_next_step=False
@@ -675,7 +675,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     #======================
     
     sample_count_train = len(dataset)
-    noise = 0.01
+    noise = 0
     epoch_refine = 100
     delta = 10*noise/epoch_refine
     #delta = 1
@@ -930,7 +930,7 @@ def parse_opt(known=False):
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
     parser.add_argument('--workers', type=int, default=8, help='max dataloader workers (per RANK in DDP mode)')
     parser.add_argument('--project', default=ROOT / 'runs/train_ima', help='save to project/name')
-    parser.add_argument('--name', default='BCCD_ima', help='save to project/name')
+    parser.add_argument('--name', default='BCCD_ima_L2_0', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
     parser.add_argument('--linear-lr', action='store_true', help='linear LR')

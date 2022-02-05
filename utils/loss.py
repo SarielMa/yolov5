@@ -313,7 +313,7 @@ class MyComputeLoss:
         lcls *= self.hyp['cls']
         #bs = tobj.shape[0]  # batch size
 
-        return (lbox + lobj + lcls), lbox, lobj, lcls# should be of size bs
+        return (lbox + lobj + lcls)*bs, lbox, lobj, lcls# should be of size bs
     
 
     def build_targets(self, p, targets):

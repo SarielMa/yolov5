@@ -453,12 +453,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
            # adversarial attack
-            noise = 0.01
+            noise = 1
             im = imgs.clone()
             if noise>0:
                 max_iter = 20
                 step = 5*noise/max_iter
-                im = pgd_attack(model, imgs, targets.to(device), noise_norm=noise, norm_type=np.inf, max_iter = max_iter, step = step,loss_fn = compute_loss)
+                im = pgd_attack(model, imgs, targets.to(device), noise_norm=noise, norm_type=2, max_iter = max_iter, step = step,loss_fn = compute_loss)
 
 
             # Forward
@@ -610,7 +610,7 @@ def parse_opt(known=False):
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
     parser.add_argument('--cache', type=str, nargs='?', const='ram', help='--cache images in "ram" (default) or "disk"')
     parser.add_argument('--image-weights', action='store_true', help='use weighted image selection for training')
-    parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--device', default='1', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--multi-scale', action='store_true', help='vary img-size +/- 50%%')
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
     parser.add_argument('--optimizer', type=str, choices=['SGD', 'Adam', 'AdamW'], default='SGD', help='optimizer')
