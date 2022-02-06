@@ -453,7 +453,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
            # adversarial attack
-            noise = 1
+            noise = 10
             im = imgs.clone()
             if noise>0:
                 max_iter = 20

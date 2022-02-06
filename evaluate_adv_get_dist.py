@@ -348,7 +348,7 @@ def run(data,
         dt[1] += time_sync() - t2
 
 
-        loss, l1, l2, l3 = compute_loss.get_loss(train_out, targets)  # box, obj, cls
+        l1, l2, l3 = compute_loss.get_evals(train_out, targets)  # box, obj, cls
         iou.append(l1.cpu().numpy())
         iouR.append(l2.cpu().numpy())
         clas.append(l3.cpu().numpy())
@@ -372,12 +372,12 @@ def run(data,
     
     zscore = 2
         
-    return estimateMean(iou,zscore), estimateMean(iouR,-zscore), estimateMean(clas,-zscore)      
+    return estimateMean(iou,zscore), estimateMean(iouR,zscore), estimateMean(clas,zscore)      
 
 def estimateMean(l,z):
     mean,std = np.mean(l),np.std(l)
     # one z score
-    return huber(l)[0].item()-z*huber(l)[1].item()
+    return huber(l)[0].item()+z*huber(l)[1].item()
 
 
 def parse_opt():

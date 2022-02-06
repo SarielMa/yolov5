@@ -31,7 +31,6 @@ from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD, Adam, AdamW, lr_scheduler
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -67,18 +66,17 @@ WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 
 
 
-def IMA_update_margin(E, delta, max_margin, flag1, margin_new):
+def IMA_update_margin(E, delta, max_margin, flag1, flag2, margin_new):
     # margin: to be updated
     # delta: margin expansion step size
     # max_margin: maximum margin
     # flag1, flag2, margin_new: from IMA_check_margin
-    expand=(flag1==1)
-    no_expand=(flag1==0)
+    expand=(flag1==1)&(flag2==1)
+    no_expand=(flag1==0)&(flag2==1)
     E[expand]+=delta #expand
     E[no_expand]=margin_new[no_expand]# refine
     E.clamp_(min=0, max=max_margin)
     print (expand.sum().item(),"samples are expanded.....")
-
 
 
 #%% IMA section
@@ -93,9 +91,7 @@ def pgd_attack(net, img, gt,
                stop_if_label_change=False,
                stop_if_label_change_next_step=False,
                use_optimizer=False,
-               get_evals = None,
-               get_loss = None, 
-               classify_model_output=None,               
+               get_loss=None, classify_model_output=None,               
                model_eval_attack=False):
     #-------------------------------------------
     train_mode=net.training# record the mode
@@ -127,27 +123,31 @@ def pgd_attack(net, img, gt,
         
         #pred, loss=run_model(net, Xn, gt, return_loss=True, reduction='sum')
         train_out = net(Xn)
-        l1, l2, l3 = get_evals(train_out, gt)
-        loss = get_loss(train_out, gt)
+        loss, l1, l2, l3 = get_loss(train_out, gt)
         #========================================
         Ypn_e_Y=classify_model_output(l1, l2, l3)
         Ypn_ne_Y=~Ypn_e_Y
         #---------------------------
-        #untargeted
-        A=Ypn_e_Y
-        A_old=Ypn_old_e_Y
-        B=Ypn_ne_Y
+        A=Ypn_ne_Y
+        A_old=Ypn_old_ne_Y
+        B=Ypn_e_Y
+        loss=-loss
         #---------------------------
         temp1=(A&A_old)&(advc<1)
+        #temp1=(A&A_old)
         Xn1[temp1]=Xn[temp1].data# last right and this right
         temp2=(B&A_old)&(advc<1)
+        #temp2=(B&A_old)
         Xn2[temp1]=Xn[temp1].data# last right and this right
-        Xn2[temp2]=Xn[temp2].data# last right and this wrong        
+        Xn2[temp2]=Xn[temp2].data# last right and this wrong
+        
         advc[B]+=1#
+        #advc[B] = 1
+        #advc[A] = 0
         #---------------------------
         if n < max_iter:
             #loss.backward() will update W.grad
-            grad_n=torch.autograd.grad(loss, Xn)[0]
+            grad_n=torch.autograd.grad(loss.sum(), Xn)[0]
             grad_n=normalize_grad_(grad_n, norm_type)
 
             Xnew = Xn + step*grad_n
@@ -155,6 +155,8 @@ def pgd_attack(net, img, gt,
             #---------------------
             clip_norm_(noise, norm_type, noise_norm)
             Xn = torch.clamp(img+noise, clip_X_min, clip_X_max)
+            #Xn = img+noise
+            #noise.data -= noise.data-(Xn-img).data
             #---------------------
             Ypn_old_e_Y=Ypn_e_Y
             Ypn_old_ne_Y=Ypn_ne_Y
@@ -167,7 +169,7 @@ def pgd_attack(net, img, gt,
     if stop_near_boundary == True:
         temp=advc>0
         if temp.sum()>0:
-            Xn_out=refine_Xn_onto_boundary(net, Xn1, Xn2, gt, refine_Xn_max_iter, get_evals, classify_model_output)
+            Xn_out=refine_Xn_onto_boundary(net, Xn1, Xn2, gt, refine_Xn_max_iter, get_loss, classify_model_output)
     #---------------------------
     if train_mode == True and net.training == False:
         net.train()
@@ -175,14 +177,14 @@ def pgd_attack(net, img, gt,
     return Xn_out, advc
 
 #%%
-def refine_onto_boundary(net, Xn1, Xn2, gt, max_iter, get_evals, classify_model_output):
+def refine_onto_boundary(net, Xn1, Xn2, gt, max_iter, run_model, classify_model_output):
 #note: Xn1 and Xn2 will be modified
     with torch.no_grad():
         Xn=(Xn1+Xn2)/2
         for k in range(0, max_iter):
             #pred =run_model(net, Xn, gt, return_loss=False)
             train_out = net(Xn)
-            l1, l2, l3 = get_evals(train_out, gt)            
+            loss, l1, l2, l3 = run_model(train_out, gt)            
             Ypn_e_Y=classify_model_output(l1,l2,l3)
             Ypn_ne_Y=~Ypn_e_Y
             Xn1[Ypn_e_Y]=Xn[Ypn_e_Y]
@@ -190,9 +192,9 @@ def refine_onto_boundary(net, Xn1, Xn2, gt, max_iter, get_evals, classify_model_
             Xn=(Xn1+Xn2)/2
     return Xn, Xn1, Xn2
 #%%
-def refine_Xn_onto_boundary(net, Xn1, Xn2, gt, max_iter, get_evals, classify_model_output):
+def refine_Xn_onto_boundary(net, Xn1, Xn2, gt, max_iter, run_model, classify_model_output):
 #note: Xn1 and Xn2 will be modified
-    Xn, Xn1, Xn2=refine_onto_boundary(net, Xn1, Xn2, gt, max_iter, get_evals, classify_model_output)
+    Xn, Xn1, Xn2=refine_onto_boundary(net, Xn1, Xn2, gt, max_iter, run_model, classify_model_output)
     return Xn
 
 
@@ -209,9 +211,7 @@ def repeated_pgd_attack(net, img, gt,
                         stop_if_label_change=False,
                         stop_if_label_change_next_step=False,
                         use_optimizer=False,
-                        get_evals=None, 
-                        get_loss = None,
-                        classify_model_output=None,
+                        run_model=None, classify_model_output=None,
                         model_eval_attack=False,
                         num_repeats=1):
     for m in range(0, num_repeats):
@@ -226,9 +226,7 @@ def repeated_pgd_attack(net, img, gt,
                                stop_if_label_change,
                                stop_if_label_change_next_step,
                                use_optimizer,
-                               get_evals, 
-                               get_loss,
-                               classify_model_output,
+                               run_model, classify_model_output,
                                model_eval_attack)
         if m == 0:
             Xn=Xm
@@ -254,8 +252,7 @@ def IMA_loss(net, img, gt,
              use_optimizer = False,
              pgd_num_repeats=1,
              get_loss=None,
-             get_evals=None,
-             classify_model_adv_output=None
+             classify_model_std_output=None, classify_model_adv_output=None
              ):
     #----------------------------------
     if isinstance(step, torch.Tensor):
@@ -263,46 +260,77 @@ def IMA_loss(net, img, gt,
         step=step.view(-1, *temp)
     #-----------------------------------
     train_out = net(img)
+    loss_X, l1, l2, l3 = get_loss(train_out, gt)
+    Yp_e_Y=classify_model_std_output(l1, l2, l3)
+    Yp_ne_Y=~Yp_e_Y 
     #-----------------------------------
+    loss1=torch.tensor(0.0, dtype=img.dtype, device=img.device, requires_grad=True)
     loss2=torch.tensor(0.0, dtype=img.dtype, device=img.device, requires_grad=True)
-    loss3=torch.tensor(0.0, dtype=img.dtype, device=img.device, requires_grad=True)  
+    loss3=torch.tensor(0.0, dtype=img.dtype, device=img.device, requires_grad=True)
+    
     Xn=torch.tensor([], dtype=img.dtype, device=img.device)
+    Ypn=torch.tensor([], dtype=gt.dtype, device=gt.device)
+    advc=torch.zeros(img.size(0), dtype=torch.int64, device=img.device)
+    idx_n=torch.tensor([], dtype=torch.int64, device=img.device)
     #----------------------------------
-
-    loss2 = get_loss(train_out, gt)
+    if Yp_ne_Y.sum().item()>0:
+        loss1 = loss_X[Yp_ne_Y].sum()/Yp_ne_Y.sum().item()
+    if Yp_e_Y.sum().item()>0:
+        loss2 = loss_X[Yp_e_Y].sum()/Yp_e_Y.sum().item()
     #---------------------------------
     train_mode=net.training# record the mode
+    #---------------------------------
+    # we ingore the re_initial, there is no need to use enable_loss3 
+    enable_loss3=False
+    
+    if Yp_e_Y.sum().item()>0 and beta>0:
+         enable_loss3=True
     
     #----------------------------------
-    Xn, advc = repeated_pgd_attack(net, img, gt, 
-                                           noise_norm=margin, norm_type=norm_type,
-                                           max_iter=max_iter, step=step,
-                                           rand_init_norm=rand_init_norm, rand_init_Xn=rand_init_Xn,
-                                           clip_X_min=clip_X_min, clip_X_max=clip_X_max,
-                                           refine_Xn_max_iter=refine_Xn_max_iter,
-                                           Xn1_equal_X=Xn1_equal_X,
-                                           Xn2_equal_Xn=Xn2_equal_Xn,
-                                           stop_near_boundary=stop_near_boundary,
-                                           stop_if_label_change=stop_if_label_change,
-                                           stop_if_label_change_next_step=stop_if_label_change_next_step,
-                                           use_optimizer=use_optimizer,
-                                           get_evals = get_evals, 
-                                           get_loss = get_loss,
-                                           classify_model_output=classify_model_adv_output,
-                                           num_repeats=pgd_num_repeats)
+    if enable_loss3 == True:
+        #print ("loss3 is enabled...with n samples ",Yp_e_Y.sum().item() )
+        Xn, advc = repeated_pgd_attack(net, img, gt, 
+                                               noise_norm=margin, norm_type=norm_type,
+                                               max_iter=max_iter, step=step,
+                                               rand_init_norm=rand_init_norm, rand_init_Xn=rand_init_Xn,
+                                               clip_X_min=clip_X_min, clip_X_max=clip_X_max,
+                                               refine_Xn_max_iter=refine_Xn_max_iter,
+                                               Xn1_equal_X=Xn1_equal_X,
+                                               Xn2_equal_Xn=Xn2_equal_Xn,
+                                               stop_near_boundary=stop_near_boundary,
+                                               stop_if_label_change=stop_if_label_change,
+                                               stop_if_label_change_next_step=stop_if_label_change_next_step,
+                                               use_optimizer=use_optimizer,
+                                               run_model=get_loss, classify_model_output=classify_model_adv_output,
+                                               num_repeats=pgd_num_repeats)
+        #--------------------------------------------
+    
+        if train_mode == True and net.training == False:
+            net.train()
+        #--------------------------------------------
+        idx_n=torch.arange(0,img.size(0))[Yp_e_Y]
+        #pred, loss_Xn=run_model_std(net, Xn, gt,return_loss=True)
+        train_outn = net(Xn)
+        loss_Xn,_,_,_ = get_loss(train_outn, gt)
+        Xn=Xn[idx_n]
+        if idx_n.size(0)>0:   
+            loss3 = loss_Xn[idx_n].sum()/Xn.size(0)
+    #--------------------------------------------
+    if beta_position == 0:
+        loss=(1-beta)*loss1+(beta*0.5)*(loss2+loss3)
+    elif beta_position == 1:
+        loss=(1-beta)*(loss1+loss2)+beta*loss3
+    elif beta_position == 2:
+        loss=loss1+(1-beta)*loss2+beta*loss3
+    elif beta_position == 3:
+        loss=(1-beta)*loss1+beta*loss3
+    else:
+        raise ValueError('unknown beta_position')
     #--------------------------------------------
     if train_mode == True and net.training == False:
         net.train()
-    train_outn = net(Xn)
-    loss3 = get_loss(train_outn, gt)
     #--------------------------------------------
-    #combine two loss functions
-    loss=(1-beta)*(loss2)+beta*loss3
-    #--------------------------------------------
-    if train_mode == True and net.training == False:
-        net.train()
-    #--------------------------------------------
-    return loss, advc, Xn
+    return loss, Yp_e_Y, advc, Xn, idx_n
 
 
 #%% pgd section
@@ -392,7 +420,7 @@ def get_noise_init(norm_type, noise_norm, init_norm, X):
 
 
 #
-def classify_model_std_output_reg(l1, l2, l3):# did not apply for this experiment
+def classify_model_std_output_reg(l1, l2, l3):
     t1 = 10000000000
     t2 = 10000000000
     t3 = 10000000000
@@ -400,8 +428,8 @@ def classify_model_std_output_reg(l1, l2, l3):# did not apply for this experimen
     return Yp_e_Y
 #
 def classify_model_adv_output_reg(l1, l2, l3):
-    t1 = 0.0440244084744878
-    t2 = 0.049166801575797725
+    t1 = 0.016733793920832067
+    t2 = 0.04916848624661529
     t3 = 0.010525250147504777
     Yp_e_Y=(l1<=t1)&(l2<=t2)&(l3<=t3)
     return Yp_e_Y
@@ -647,12 +675,16 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     #======================
     
     sample_count_train = len(dataset)
-    noise = 10
+    noise = 0
     epoch_refine = 100
     delta = 10*noise/epoch_refine
+    #delta = 1
     E = delta*torch.ones(sample_count_train, dtype=torch.float32)
     bottom = delta*torch.ones(sample_count_train, dtype=torch.float32)
-    max_iter = 20   
+    #alpha = 5 
+    
+    max_iter=20   
+    #step  = 5*noise/max_iter
     norm_type = 2           
     alpha = 5
  #++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -680,7 +712,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         
         #+++++++++++++++++++++++
         flag1=torch.zeros(len(E), dtype=torch.float32)
+        flag2=torch.zeros(len(E), dtype=torch.float32)
         E_new=E.detach().clone()
+        
         #+++++++++++++++++++++++++++++
         
         
@@ -717,7 +751,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
                 #pred1 = model(imgs)  # forward
                 #loss1, loss1_items = compute_loss(pred1, targets.to(device))  # loss scaled by batch_size
-                loss, advc, Xn = IMA_loss(model, imgs, targets.to(device),
+                loss, Yp_e_Y, advc, Xn, idx_n = IMA_loss(model, imgs, targets.to(device),
                                                         norm_type= norm_type,
                                                         rand_init_norm=rand_init_norm,
                                                         margin=margin,
@@ -730,9 +764,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                                         stop_if_label_change=stop_if_label_change,
                                                         stop_if_label_change_next_step=stop_if_label_change_next_step,
                                                         beta=0.5, beta_position=1,
-                                                        use_optimizer=False,          
-                                                        get_evals = compute_loss.get_evals,
-                                                        get_loss=compute_loss.get_loss,                                                      
+                                                        use_optimizer=False,                                                
+                                                        get_loss=compute_loss.get_loss,
+                                                        classify_model_std_output=classify_model_std_output_reg,                                                       
                                                         classify_model_adv_output=classify_model_adv_output_reg)               
 
                 if RANK != -1:
@@ -753,13 +787,19 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 last_opt_step = ni
          #--------------------update the margins
             #Yp_e_Y=classify_model_std_output_reg(pred, targets)
-            flag1[idx[advc==0]]=1 # those still correct after noise
-
-            temp=torch.norm((Xn-imgs).view(Xn.shape[0], -1), p=norm_type, dim=1).cpu()
-            #E_new[idx[idx_n]]=torch.min(E_new[idx[idx_n]], temp)     
-            #bottom = args.delta*torch.ones(E_new.size(0), dtype=E_new.dtype, device=E_new.device)
-            E_new[idx] = torch.max((E_new[idx]+temp)/2, bottom[idx])# use mean to refine the margin to reduce the effect of augmentation on margins
+            flag1[idx[advc==0]]=1
+            flag2[idx[Yp_e_Y]]=1
+            #flag2[idx]=1
+            if idx_n.shape[0]>0:
+                temp=torch.norm((Xn-imgs[idx_n]).view(Xn.shape[0], -1), p=norm_type, dim=1).cpu()
+                #E_new[idx[idx_n]]=torch.min(E_new[idx[idx_n]], temp)     
+                #bottom = args.delta*torch.ones(E_new.size(0), dtype=E_new.dtype, device=E_new.device)
+                E_new[idx[idx_n]] = torch.max((E_new[idx[idx_n]]+temp)/2, bottom[idx[idx_n]])# use mean to refine the margin to reduce the effect of augmentation on margins
         #-----------------------------------------------------------------------
+            
+
+
+
             # Log
             if RANK in [-1, 0]:
                 #mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
@@ -834,15 +874,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         #    break  # must break all DDP ranks
 
         # end epoch ----------------------------------------------------------------------------------------------------
-        IMA_update_margin(E, delta, noise, flag1,  E_new)
-        # draw margins
-
-        plt.hist(E.cpu().numpy(), bins=100, range=(0, noise))
-        plt.savefig(save_dir /"training.png")
-   # end training -----------------------------------------------------------------------------------------------------
-
-   
-    # total evaluation 
+        IMA_update_margin(E, delta, noise, flag1, flag2, E_new)
+    # end training -----------------------------------------------------------------------------------------------------
     if RANK in [-1, 0]:
         LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
         for f in last, best:
@@ -898,7 +931,7 @@ def parse_opt(known=False):
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
     parser.add_argument('--workers', type=int, default=8, help='max dataloader workers (per RANK in DDP mode)')
     parser.add_argument('--project', default=ROOT / 'runs/train_ima', help='save to project/name')
-    parser.add_argument('--name', default='BCCD_ima_L2_10', help='save to project/name')
+    parser.add_argument('--name', default='BCCD_ima_L2_0', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
     parser.add_argument('--linear-lr', action='store_true', help='linear LR')
