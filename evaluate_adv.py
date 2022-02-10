@@ -158,10 +158,7 @@ def pgd_attack(net, img, gt, noise_norm, norm_type, max_iter, step, loss_fn,
         #--------------------------------------------------------
         with torch.enable_grad(): ##this is super strange!!!! without this, Xn cannot get grad though any computing. why ??????
             out, train_out = net(Xn)
-        loss = loss_fn([x.float() for x in train_out], gt)[0]
-        #---------------------------
-        if targeted == True:
-            loss=-loss
+            loss = loss_fn([x.float() for x in train_out], gt)[0]
         #---------------------------
         #loss.backward() will update W.grad
         grad_n=torch.autograd.grad(loss, Xn)[0]
@@ -230,7 +227,7 @@ def process_batch(detections, labels, iouv):
 def run(data,
         weights=None,  # model.pt path(s)
         batch_size=32,  # batch size
-        imgsz=640,  # inference size (pixels)
+        imgsz=320,  # inference size (pixels)
         conf_thres=0.001,  # confidence threshold
         iou_thres=0.6,  # NMS IoU threshold
         task='test',  # train, val, test, speed or study
@@ -243,7 +240,7 @@ def run(data,
         save_hybrid=False,  # save label+prediction hybrid results to *.txt
         save_conf=False,  # save confidences in --save-txt labels
         save_json=False,  # save a COCO-JSON results file
-        project=ROOT / 'runs/val',  # save to project/name
+        project=ROOT / 'runs/test',  # save to project/name
         name='exp',  # save to project/name
         exist_ok=False,  # existing project/name ok, do not increment
         half=True,  # use FP16 half-precision inference
@@ -254,6 +251,7 @@ def run(data,
         plots=True,
         callbacks=Callbacks(),
         compute_loss=None,
+        this_noise = None
         ):
     # Initialize/load model and set device
     #attempt_load(f, device).half()
@@ -337,12 +335,12 @@ def run(data,
         t2 = time_sync()
         dt[0] += t2 - t1
         
-        # adversarial attack
-        noise = 0.1
+        # adversarial attack, measured with L2-norm
+        noise = float(this_noise)
         if noise>0:
             max_iter = 100
             step = 5*noise/max_iter
-            im = pgd_attack(model.model, im, targets, noise_norm=noise, norm_type=np.inf, max_iter = max_iter, step = step,loss_fn = compute_loss)
+            im = pgd_attack(model.model, im, targets, noise_norm=noise, norm_type=2, max_iter = max_iter, step = step,loss_fn = compute_loss)
 
         # Inference
         out, train_out = model(im) if training else model(im, augment=augment, val=True)  # inference, loss outputs
@@ -434,32 +432,6 @@ def run(data,
         confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
         callbacks.run('on_val_end')
 
-    # Save JSON
-    if save_json and len(jdict):
-        w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
-        anno_json = str(Path(data.get('path', '../coco')) / 'annotations/instances_val2017.json')  # annotations json
-        pred_json = str(save_dir / f"{w}_predictions.json")  # predictions json
-        LOGGER.info(f'\nEvaluating pycocotools mAP... saving {pred_json}...')
-        with open(pred_json, 'w') as f:
-            json.dump(jdict, f)
-
-        try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
-            check_requirements(['pycocotools'])
-            from pycocotools.coco import COCO
-            from pycocotools.cocoeval import COCOeval
-
-            anno = COCO(anno_json)  # init annotations api
-            pred = anno.loadRes(pred_json)  # init predictions api
-            eval = COCOeval(anno, pred, 'bbox')
-            if is_coco:
-                eval.params.imgIds = [int(Path(x).stem) for x in dataloader.dataset.img_files]  # image IDs to evaluate
-            eval.evaluate()
-            eval.accumulate()
-            eval.summarize()
-            map, map50 = eval.stats[:2]  # update results (mAP@0.5:0.95, mAP@0.5)
-        except Exception as e:
-            LOGGER.info(f'pycocotools unable to run: {e}')
-
     # Return results
     model.float()  # for training
     if not training:
@@ -468,15 +440,16 @@ def run(data,
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
+    #return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
+    return mp, mr, map50, map
 
 
-def parse_opt():
+def parse_opt(model, noise):
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', type=str, default=ROOT / 'data/bcc.yaml', help='dataset.yaml path')
-    parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'runs/train/BCCD/weights/best.pt', help='model.pt path(s)')
+    parser.add_argument('--weights', nargs='+', type=str, default=ROOT / model, help='model.pt path(s)')
     parser.add_argument('--batch-size', type=int, default=32, help='batch size')
-    parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='inference size (pixels)')
+    parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=320, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.6, help='NMS IoU threshold')
     parser.add_argument('--task', default='test', help='train, val, test, speed or study')
@@ -494,6 +467,7 @@ def parse_opt():
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
+    parser.add_argument('--this_noise',default= noise)
     opt = parser.parse_args()
     opt.data = check_yaml(opt.data)  # check YAML
     opt.save_json |= opt.data.endswith('coco.yaml')
@@ -504,35 +478,67 @@ def parse_opt():
 
 def main(opt):
     check_requirements(requirements=ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))
+    return run(**vars(opt))
 
-    if opt.task in ('train', 'val', 'test'):  # run normally
-        if opt.conf_thres > 0.001:  # https://github.com/ultralytics/yolov5/issues/1466
-            LOGGER.info(f'WARNING: confidence threshold {opt.conf_thres} >> 0.001 will produce invalid mAP values.')
-        run(**vars(opt))
 
-    else:
-        weights = opt.weights if isinstance(opt.weights, list) else [opt.weights]
-        opt.half = True  # FP16 for fastest results
-        if opt.task == 'speed':  # speed benchmarks
-            # python val.py --task speed --data coco.yaml --batch 1 --weights yolov5n.pt yolov5s.pt...
-            opt.conf_thres, opt.iou_thres, opt.save_json = 0.25, 0.45, False
-            for opt.weights in weights:
-                run(**vars(opt), plots=False)
-
-        elif opt.task == 'study':  # speed vs mAP benchmarks
-            # python val.py --task study --data coco.yaml --iou 0.7 --weights yolov5n.pt yolov5s.pt...
-            for opt.weights in weights:
-                f = f'study_{Path(opt.data).stem}_{Path(opt.weights).stem}.txt'  # filename to save to
-                x, y = list(range(256, 1536 + 128, 128)), []  # x axis (image sizes), y axis
-                for opt.imgsz in x:  # img-size
-                    LOGGER.info(f'\nRunning {f} --imgsz {opt.imgsz}...')
-                    r, _, t = run(**vars(opt), plots=False)
-                    y.append(r + t)  # results and times
-                np.savetxt(f, y, fmt='%10.4g')  # save
-            os.system('zip -r study.zip study_*.txt')
-            plot_val_study(x=x)  # plot
 
 
 if __name__ == "__main__":
-    opt = parse_opt()
-    main(opt)
+    models = ['runs/train/BCCD/weights/best.pt',
+              'runs/train_adv/BCCD_adv_L2_5/weights/best.pt',
+              'runs/train_adv/BCCD_adv_L2_10/weights/best.pt',
+              'runs/train_adv/BCCD_adv_L2_15/weights/best.pt',
+              'runs/train_ima/BCCD_ima_L2_10/weights/best.pt',
+              'runs/train_ima/BCCD_ima_L2_102/weights/best.pt',
+              'runs/train_ima/BCCD_ima_L2_103/weights/best.pt']
+    
+    for p in models:
+        assert(os.path.exists(p))
+    print('all the models exist!!!!!!!!!!!!!!!!!!!!!')
+    model_names = ['YoloV5', 'adv5','adv10','adv15','ima_d1','ima_d2','ima_d5'] 
+    
+    ######################################################
+    #models = ['runs/train/BCCD/weights/best.pt']
+    #model_names = ['YoloV5']
+    noises = [0,5,10,15]
+    measures = ['Precision','Recall','mAP0.5','mAP0.5:0.95']
+    measures_save = ['Precision','Recall','mAP0.5','mAP']
+    mp_list = []
+    mr_list = []
+    map50_list = []
+    map_list = []
+    for i, model in enumerate(models):
+        one_method_mp = [model_names[i]]
+        one_method_mr = [model_names[i]]
+        one_method_map50 = [model_names[i]]
+        one_method_map = [model_names[i]]
+        
+        for n in noises:
+            opt = parse_opt(model, n)
+            mp, mr, mAP50, mAP = main(opt)
+            one_method_mp.append(mp)
+            one_method_mr.append(mr)
+            one_method_map50.append(mAP50)
+            one_method_map.append(mAP)
+        mp_list.append(one_method_mp)
+        mr_list.append(one_method_mr)
+        map50_list.append(one_method_map50)
+        map_list.append(one_method_map)
+   
+    all_list = [mp_list, mr_list, map50_list, map_list]
+    
+    import matplotlib.pyplot as plt
+    color = ['r','b','g','y','m','c','k']
+    for j, m in enumerate(measures):
+        plt.title(measures[j])
+        plt.ylabel(measures[j])
+        plt.xlabel("noise(L2)")
+        this_list = all_list[j] # the jth measure list
+        for i, n in enumerate(model_names):
+            plt.plot(noises, this_list[i][1:], color = color[i], label = model_names[i])
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(measures_save[j]+"result.pdf",bbox_inches='tight')
+        plt.clf()
+        
+    

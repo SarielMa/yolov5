@@ -649,7 +649,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     sample_count_train = len(dataset)
     noise = 10
     epoch_refine = 100
-    delta = 10*noise/epoch_refine
+    delta = 50*noise/epoch_refine
     E = delta*torch.ones(sample_count_train, dtype=torch.float32)
     bottom = delta*torch.ones(sample_count_train, dtype=torch.float32)
     max_iter = 20   
