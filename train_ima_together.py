@@ -31,6 +31,7 @@ from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD, Adam, AdamW, lr_scheduler
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -44,7 +45,7 @@ from models.yolo import Model
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
-from utils.datasets import create_dataloader
+from utils.datasets import my_create_dataloader, create_dataloader
 from utils.downloads import attempt_download
 from utils.general import (LOGGER, check_dataset, check_file, check_git_status, check_img_size, check_requirements,
                            check_suffix, check_yaml, colorstr, get_latest_run, increment_path, init_seeds,
@@ -52,7 +53,7 @@ from utils.general import (LOGGER, check_dataset, check_file, check_git_status, 
                            print_args, print_mutation, strip_optimizer)
 from utils.loggers import Loggers
 from utils.loggers.wandb.wandb_utils import check_wandb_resume
-from utils.loss import ComputeLoss
+from utils.loss import MyComputeLoss, ComputeLoss
 from utils.metrics import fitness
 from utils.plots import plot_evolve, plot_labels
 from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_device, torch_distributed_zero_first
@@ -61,6 +62,250 @@ LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 
+
+#%% IMA for regression problem part
+
+
+
+def IMA_update_margin(E, delta, max_margin, flag1, margin_new):
+    # margin: to be updated
+    # delta: margin expansion step size
+    # max_margin: maximum margin
+    # flag1, flag2, margin_new: from IMA_check_margin
+    expand=(flag1==1)
+    no_expand=(flag1==0)
+    E[expand]+=delta #expand
+    E[no_expand]=margin_new[no_expand]# refine
+    E.clamp_(min=0, max=max_margin)
+    print (expand.sum().item(),"samples are expanded.....")
+
+
+
+#%% IMA section
+
+def pgd_attack(net, img, gt, 
+               noise_norm, norm_type, max_iter, step,
+               rand_init_norm=None, rand_init_Xn=None,
+               targeted=False, clip_X_min=-1, clip_X_max=1,
+               refine_Xn_max_iter=10,
+               Xn1_equal_X=False, Xn2_equal_Xn=False,
+               stop_near_boundary=False,
+               stop_if_label_change=False,
+               stop_if_label_change_next_step=False,
+               use_optimizer=False,
+               get_evals = None,
+               get_loss = None, 
+               classify_model_output=None,               
+               model_eval_attack=False):
+    #-------------------------------------------
+    train_mode=net.training# record the mode
+    if model_eval_attack == True and train_mode == True:
+        net.eval()#set model to evaluation mode
+    #-----------------
+    img = img.detach()
+    #-----------------
+    advc=torch.zeros(img.size(0), dtype=torch.int64, device=img.device)
+    #-----------------
+    if rand_init_norm is None:
+        rand_init_norm = noise_norm
+        
+    noise_init=get_noise_init(norm_type, noise_norm, rand_init_norm, img)    
+    Xn = img + noise_init
+    #-----------------
+    Xn1=img.detach().clone()
+    Xn2=img.detach().clone()
+    Ypn_old_e_Y=torch.ones(img.shape[0], dtype=torch.bool, device=gt.device)
+    Ypn_old_ne_Y=~Ypn_old_e_Y
+    #-----------------
+    noise=(Xn-img).detach()
+
+    #-----------------
+    for n in range(0, max_iter+1):
+        Xn = Xn.detach()
+        Xn.requires_grad = True  
+        # run the model and get pred result
+        
+        #pred, loss=run_model(net, Xn, gt, return_loss=True, reduction='sum')
+        train_out = net(Xn)
+        l1, l2, l3 = get_evals(train_out, gt)
+        loss = get_loss(train_out, gt)
+        #========================================
+        Ypn_e_Y=classify_model_output(l1, l2, l3)
+        Ypn_ne_Y=~Ypn_e_Y
+        #---------------------------
+        #untargeted
+        A=Ypn_e_Y
+        A_old=Ypn_old_e_Y
+        B=Ypn_ne_Y
+        #---------------------------
+        temp1=(A&A_old)&(advc<1)
+        Xn1[temp1]=Xn[temp1].data# last right and this right
+        temp2=(B&A_old)&(advc<1)
+        Xn2[temp1]=Xn[temp1].data# last right and this right
+        Xn2[temp2]=Xn[temp2].data# last right and this wrong        
+        advc[B]+=1#
+        #---------------------------
+        if n < max_iter:
+            #loss.backward() will update W.grad
+            grad_n=torch.autograd.grad(loss, Xn)[0]
+            grad_n=normalize_grad_(grad_n, norm_type)
+
+            Xnew = Xn + step*grad_n
+            noise = Xnew-img
+            #---------------------
+            clip_norm_(noise, norm_type, noise_norm)
+            Xn = torch.clamp(img+noise, clip_X_min, clip_X_max)
+            #---------------------
+            Ypn_old_e_Y=Ypn_e_Y
+            Ypn_old_ne_Y=Ypn_ne_Y
+    #---------------------------
+    Xn_out = Xn.detach()
+    if Xn1_equal_X:
+        Xn1=img.detach().clone()
+    if Xn2_equal_Xn:
+        Xn2=Xn
+    if stop_near_boundary == True:
+        temp=advc>0
+        if temp.sum()>0:
+            Xn_out=refine_Xn_onto_boundary(net, Xn1, Xn2, gt, refine_Xn_max_iter, get_evals, classify_model_output)
+    #---------------------------
+    if train_mode == True and net.training == False:
+        net.train()
+    #---------------------------
+    return Xn_out, advc
+
+#%%
+def refine_onto_boundary(net, Xn1, Xn2, gt, max_iter, get_evals, classify_model_output):
+#note: Xn1 and Xn2 will be modified
+    with torch.no_grad():
+        Xn=(Xn1+Xn2)/2
+        for k in range(0, max_iter):
+            #pred =run_model(net, Xn, gt, return_loss=False)
+            train_out = net(Xn)
+            l1, l2, l3 = get_evals(train_out, gt)            
+            Ypn_e_Y=classify_model_output(l1,l2,l3)
+            Ypn_ne_Y=~Ypn_e_Y
+            Xn1[Ypn_e_Y]=Xn[Ypn_e_Y]
+            Xn2[Ypn_ne_Y]=Xn[Ypn_ne_Y]
+            Xn=(Xn1+Xn2)/2
+    return Xn, Xn1, Xn2
+#%%
+def refine_Xn_onto_boundary(net, Xn1, Xn2, gt, max_iter, get_evals, classify_model_output):
+#note: Xn1 and Xn2 will be modified
+    Xn, Xn1, Xn2=refine_onto_boundary(net, Xn1, Xn2, gt, max_iter, get_evals, classify_model_output)
+    return Xn
+
+
+#%%
+
+def repeated_pgd_attack(net, img, gt, 
+                        noise_norm, norm_type, max_iter, step,
+                        rand_init_norm=None, rand_init_Xn=None,
+                        targeted=False, clip_X_min=-1, clip_X_max=1,
+                        refine_Xn_max_iter=10,
+                        Xn1_equal_X=False,
+                        Xn2_equal_Xn=False,
+                        stop_near_boundary=False,
+                        stop_if_label_change=False,
+                        stop_if_label_change_next_step=False,
+                        use_optimizer=False,
+                        get_evals=None, 
+                        get_loss = None,
+                        classify_model_output=None,
+                        model_eval_attack=False,
+                        num_repeats=1):
+    for m in range(0, num_repeats):
+        Xm, advcm = pgd_attack(net, img, gt,
+                               noise_norm, norm_type, max_iter, step,
+                               rand_init_norm, rand_init_Xn,
+                               targeted, clip_X_min, clip_X_max,
+                               refine_Xn_max_iter,
+                               Xn1_equal_X,
+                               Xn2_equal_Xn,
+                               stop_near_boundary,
+                               stop_if_label_change,
+                               stop_if_label_change_next_step,
+                               use_optimizer,
+                               get_evals, 
+                               get_loss,
+                               classify_model_output,
+                               model_eval_attack)
+        if m == 0:
+            Xn=Xm
+            advc=advcm
+        else:
+            temp=advcm>0
+            advc[temp]=advcm[temp]
+            Xn[temp]=Xm[temp]
+    #-------- 
+    return Xn, advc
+
+def IMA_loss(net, img, gt, 
+             margin, norm_type, max_iter, step,
+             rand_init_norm=None, rand_init_Xn=None,
+             clip_X_min=0, clip_X_max=1,
+             refine_Xn_max_iter=10,
+             Xn1_equal_X=False,
+             Xn2_equal_Xn=False,
+             stop_near_boundary=True,
+             stop_if_label_change=False,
+             stop_if_label_change_next_step=False,
+             beta=0.5, beta_position=1,
+             use_optimizer = False,
+             pgd_num_repeats=1,
+             get_loss=None,
+             get_evals=None,
+             classify_model_adv_output=None
+             ):
+    #----------------------------------
+    if isinstance(step, torch.Tensor):
+        temp=tuple([1]*len(img[0].size()))
+        step=step.view(-1, *temp)
+    #-----------------------------------
+    train_out = net(img)
+    #-----------------------------------
+    loss2=torch.tensor(0.0, dtype=img.dtype, device=img.device, requires_grad=True)
+    loss3=torch.tensor(0.0, dtype=img.dtype, device=img.device, requires_grad=True)  
+    Xn=torch.tensor([], dtype=img.dtype, device=img.device)
+    #----------------------------------
+
+    loss2 = get_loss(train_out, gt)
+    #---------------------------------
+    train_mode=net.training# record the mode
+    
+    #----------------------------------
+    Xn, advc = repeated_pgd_attack(net, img, gt, 
+                                           noise_norm=margin, norm_type=norm_type,
+                                           max_iter=max_iter, step=step,
+                                           rand_init_norm=rand_init_norm, rand_init_Xn=rand_init_Xn,
+                                           clip_X_min=clip_X_min, clip_X_max=clip_X_max,
+                                           refine_Xn_max_iter=refine_Xn_max_iter,
+                                           Xn1_equal_X=Xn1_equal_X,
+                                           Xn2_equal_Xn=Xn2_equal_Xn,
+                                           stop_near_boundary=stop_near_boundary,
+                                           stop_if_label_change=stop_if_label_change,
+                                           stop_if_label_change_next_step=stop_if_label_change_next_step,
+                                           use_optimizer=use_optimizer,
+                                           get_evals = get_evals, 
+                                           get_loss = get_loss,
+                                           classify_model_output=classify_model_adv_output,
+                                           num_repeats=pgd_num_repeats)
+    #--------------------------------------------
+    if train_mode == True and net.training == False:
+        net.train()
+    train_outn = net(Xn)
+    loss3 = get_loss(train_outn, gt)
+    #--------------------------------------------
+    #combine two loss functions
+    loss=(1-beta)*(loss2)+beta*loss3
+    #--------------------------------------------
+    if train_mode == True and net.training == False:
+        net.train()
+    #--------------------------------------------
+    return loss, advc, Xn
+
+
+#%% pgd section
 def clip_norm_(noise, norm_type, norm_max):
     if not isinstance(norm_max, torch.Tensor):
         clip_normA_(noise, norm_type, norm_max)
@@ -143,51 +388,16 @@ def get_noise_init(norm_type, noise_norm, init_norm, X):
     clip_norm_(noise_init, norm_type, noise_norm)
     return noise_init
 
+#%%
+#
+def classify_model_adv_output_reg(l1, l2, l3):
+    t1 = 0.0440244084744878
+    t2 = 0.049166801575797725
+    t3 = 0.010525250147504777
+    Yp_e_Y=(l1<=t1)&(l2<=t2)&(l3<=t3)
+    return Yp_e_Y
 
-
-def pgd_attack(net, img, gt, noise_norm, norm_type, max_iter, step, loss_fn, 
-               rand_init=True, rand_init_norm=None, targeted=False,
-               clip_X_min=0, clip_X_max=1):
-    #-----------------------------------------------------
-    #-----------------
-    img = img.detach()
-    #-----------------
-    if rand_init == True:
-        init_norm=rand_init_norm
-        if rand_init_norm is None:
-            init_norm=noise_norm
-        noise_init=get_noise_init(norm_type, noise_norm, init_norm, img)
-        Xn = img + noise_init
-    else:
-        Xn = img.clone().detach() # must clone
-    #-----------------
-    noise_new=(Xn-img).detach()
-
-    #-----------------
-    for n in range(0, max_iter):
-        Xn = Xn.detach()
-        Xn.requires_grad=True    
-        #--------------------------------------------------------
-        with torch.enable_grad(): ##this is super strange!!!! without this, Xn cannot get grad though any computing. why ??????
-            train_out = net(Xn)
-        loss = loss_fn(train_out, gt)[0]
-        #---------------------------
-        if targeted == True:
-            loss=-loss
-        #---------------------------
-        #loss.backward() will update W.grad
-        grad_n=torch.autograd.grad(loss, Xn)[0]
-        grad_n=normalize_grad_(grad_n, norm_type)
-        Xnew = Xn.detach() + step*grad_n.detach()
-        noise_new = Xnew-img
-        #---------------------
-        clip_norm_(noise_new, norm_type, noise_norm)
-        Xn = torch.clamp(img+noise_new, clip_X_min, clip_X_max)
-        #Xn = img + noise_new
-        noise_new.data -= noise_new.data-(Xn-img).data
-        Xn=Xn.detach()
-    #---------------------------
-    return Xn
+#%% training part of yolov5
 
 
 def train(hyp,  # path/to/hyp.yaml or hyp dictionary
@@ -348,7 +558,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         LOGGER.info('Using SyncBatchNorm()')
 
     # Trainloader
-    train_loader, dataset = create_dataloader(train_path, imgsz, batch_size // WORLD_SIZE, gs, single_cls,
+    train_loader, dataset = my_create_dataloader(train_path, imgsz, batch_size // WORLD_SIZE, gs, single_cls,
                                               hyp=hyp, augment=True, cache=opt.cache, rect=opt.rect, rank=LOCAL_RANK,
                                               workers=workers, image_weights=opt.image_weights, quad=opt.quad,
                                               prefix=colorstr('train: '), shuffle=True)
@@ -403,11 +613,40 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
     stopper = EarlyStopping(patience=opt.patience)
-    compute_loss = ComputeLoss(model)  # init loss class
+    compute_loss = MyComputeLoss(model)  # init loss class
+    val_compute_loss = ComputeLoss(model)
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
+    
+    
+    
+    #IMA parameters
+    #net.zero_grad()
+    #......................................................................................................
+    stop = 0
+    stop_near_boundary=False
+    stop_if_label_change=False
+    stop_if_label_change_next_step=False
+    if stop==1:
+        stop_near_boundary=True
+    elif stop==2:
+        stop_if_label_change=True
+    elif stop==3:
+        stop_if_label_change_next_step=True  
+    #======================
+    
+    sample_count_train = len(dataset)
+    noise = 10
+    epoch_refine = 100
+    delta = 30*noise/epoch_refine
+    E = delta*torch.ones(sample_count_train, dtype=torch.float32)
+    bottom = delta*torch.ones(sample_count_train, dtype=torch.float32)
+    max_iter = 20   
+    norm_type = 2           
+    alpha = 5
+ #++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
 
@@ -429,10 +668,17 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         if RANK in [-1, 0]:
             pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        
+        #+++++++++++++++++++++++
+        flag1=torch.zeros(len(E), dtype=torch.float32)
+        E_new=E.detach().clone()
+        #+++++++++++++++++++++++++++++
+        
+        
+        for i, (imgs, targets, paths, _, idx) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-
+            idx = torch.tensor(idx)
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
@@ -451,25 +697,35 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 if sf != 1:
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
-
-           # adversarial attack
-            noise = 12
-            im = imgs.clone()
-            if noise>0:
-                max_iter = 20
-                step = 5*noise/max_iter
-                im = pgd_attack(model, imgs, targets.to(device), noise_norm=noise, norm_type=2, max_iter = max_iter, step = step,loss_fn = compute_loss)
-
+            #+++++++++++++++++++++++++++++++++++
+            model.zero_grad()
+            rand_init_norm=torch.clamp(E[idx]-delta, min=delta).cuda()
+            margin=E[idx].cuda()
+            step=alpha*margin/max_iter
 
             # Forward
             with amp.autocast(enabled=cuda):
 
-                pred1 = model(imgs)  # forward
-                loss1, loss1_items = compute_loss(pred1, targets.to(device))  # loss scaled by batch_size
-                
-                pred2 = model(im)
-                loss2, loss2_items = compute_loss(pred2, targets.to(device))  # loss scaled by batch_size
-                loss = loss1*0.5+loss2*0.5
+                #pred1 = model(imgs)  # forward
+                #loss1, loss1_items = compute_loss(pred1, targets.to(device))  # loss scaled by batch_size
+                loss, advc, Xn = IMA_loss(model, imgs, targets.to(device),
+                                                        norm_type= norm_type,
+                                                        rand_init_norm=rand_init_norm,
+                                                        margin=margin,
+                                                        max_iter=max_iter,
+                                                        step=step,
+                                                        refine_Xn_max_iter=10,
+                                                        Xn1_equal_X=0,
+                                                        Xn2_equal_Xn=0,
+                                                        stop_near_boundary=stop_near_boundary,
+                                                        stop_if_label_change=stop_if_label_change,
+                                                        stop_if_label_change_next_step=stop_if_label_change_next_step,
+                                                        beta=0.5, beta_position=1,
+                                                        use_optimizer=False,          
+                                                        get_evals = compute_loss.get_evals,
+                                                        get_loss=compute_loss.get_loss,                                                      
+                                                        classify_model_adv_output=classify_model_adv_output_reg)               
+
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -486,7 +742,15 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 if ema:
                     ema.update(model)
                 last_opt_step = ni
+         #--------------------update the margins
+            #Yp_e_Y=classify_model_std_output_reg(pred, targets)
+            flag1[idx[advc==0]]=1 # those still correct after noise
 
+            temp=torch.norm((Xn-imgs).view(Xn.shape[0], -1), p=norm_type, dim=1).cpu()
+            #E_new[idx[idx_n]]=torch.min(E_new[idx[idx_n]], temp)     
+            #bottom = args.delta*torch.ones(E_new.size(0), dtype=E_new.dtype, device=E_new.device)
+            E_new[idx] = torch.max((E_new[idx]+temp)/2, bottom[idx])# use mean to refine the margin to reduce the effect of augmentation on margins
+        #-----------------------------------------------------------------------
             # Log
             if RANK in [-1, 0]:
                 #mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
@@ -517,7 +781,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                            save_dir=save_dir,
                                            plots=False,
                                            callbacks=callbacks,
-                                           compute_loss=compute_loss)
+                                           compute_loss=val_compute_loss)
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
@@ -561,7 +825,15 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         #    break  # must break all DDP ranks
 
         # end epoch ----------------------------------------------------------------------------------------------------
-    # end training -----------------------------------------------------------------------------------------------------
+        IMA_update_margin(E, delta, noise, flag1,  E_new)
+        # draw margins
+
+        plt.hist(E.cpu().numpy(), bins=100, range=(0, noise))
+        plt.savefig(save_dir /"training.png")
+   # end training -----------------------------------------------------------------------------------------------------
+
+   
+    # total evaluation 
     if RANK in [-1, 0]:
         LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
         for f in last, best:
@@ -581,7 +853,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                             verbose=True,
                                             plots=True,
                                             callbacks=callbacks,
-                                            compute_loss=compute_loss)  # val best model with plots
+                                            compute_loss=val_compute_loss)  # val best model with plots
                     if is_coco:
                         callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
 
@@ -598,7 +870,7 @@ def parse_opt(known=False):
     parser.add_argument('--cfg', type=str, default='models/yolov5s.yaml', help='model.yaml path')
     parser.add_argument('--data', type=str, default=ROOT / 'data/bcc.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch.yaml', help='hyperparameters path')
-    parser.add_argument('--epochs', type=int, default=600)
+    parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--batch-size', type=int, default=32, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=320, help='train, val image size (pixels)')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
@@ -610,14 +882,14 @@ def parse_opt(known=False):
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
     parser.add_argument('--cache', type=str, nargs='?', const='ram', help='--cache images in "ram" (default) or "disk"')
     parser.add_argument('--image-weights', action='store_true', help='use weighted image selection for training')
-    parser.add_argument('--device', default='1', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--multi-scale', action='store_true', help='vary img-size +/- 50%%')
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
     parser.add_argument('--optimizer', type=str, choices=['SGD', 'Adam', 'AdamW'], default='SGD', help='optimizer')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
     parser.add_argument('--workers', type=int, default=8, help='max dataloader workers (per RANK in DDP mode)')
-    parser.add_argument('--project', default=ROOT / 'runs/train_adv', help='save to project/name')
-    parser.add_argument('--name', default='BCCD_adv_L2_12', help='save to project/name')
+    parser.add_argument('--project', default=ROOT / 'runs/train_ima', help='save to project/name')
+    parser.add_argument('--name', default='BCCD_ima_L2_d3', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
     parser.add_argument('--linear-lr', action='store_true', help='linear LR')

@@ -372,7 +372,8 @@ def run(data,
     
     zscore = 2
         
-    return estimateMean(iou,zscore), estimateMean(iouR,zscore), estimateMean(clas,zscore)      
+    #return estimateMean(iou,zscore), estimateMean(iouR,zscore), estimateMean(clas,zscore)      
+    return iou.max(), iouR.max(), clas.max()
 
 def estimateMean(l,z):
     mean,std = np.mean(l),np.std(l)

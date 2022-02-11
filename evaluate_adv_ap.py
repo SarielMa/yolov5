@@ -47,9 +47,6 @@ from utils.torch_utils import select_device, time_sync
 from utils.loss import ComputeLoss
 from models.experimental import attempt_load
 from torch.cuda import amp
-import random
-
-random.seed(10)
 #%% adversarial attack section
 
 def clip_norm_(noise, norm_type, norm_max):
@@ -420,9 +417,11 @@ def run(data,
     LOGGER.info(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
 
     # Print results per class
+    """
     if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
         for i, c in enumerate(ap_class):
             LOGGER.info(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
+    """
 
     # Print speeds
     t = tuple(x / seen * 1E3 for x in dt)  # speeds per image
@@ -444,7 +443,7 @@ def run(data,
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
     #return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
-    return mp, mr, map50, map
+    return p, r
 
 
 def parse_opt(model, noise):
@@ -488,20 +487,20 @@ def main(opt):
 
 if __name__ == "__main__":
     models = ['runs/train/BCCD/weights/last.pt',
-              'runs/train_adv/BCCD_adv_L2_3/weights/last.pt',
-              'runs/train_adv/BCCD_adv_L2_6/weights/last.pt',
-              'runs/train_adv/BCCD_adv_L2_9/weights/last.pt',
-              'runs/train_ima/BCCD_ima_L2_d3/weights/last.pt']
+              'runs/train_adv/BCCD_adv_L2_5/weights/last.pt',
+              'runs/train_adv/BCCD_adv_L2_10/weights/last.pt',
+              'runs/train_adv/BCCD_adv_L2_15/weights/last.pt',
+              'runs/train_ima/BCCD_ima_L2_103/weights/last.pt']
     
     for p in models:
         assert(os.path.exists(p))
     print('all the models exist!!!!!!!!!!!!!!!!!!!!!')
-    model_names = ['YoloV5', 'adv3','adv6','adv9','IMAd3'] 
+    model_names = ['YoloV5', 'adv5','adv10','adv15','IMA'] 
     
     ######################################################
     #models = ['runs/train/BCCD/weights/best.pt']
     #model_names = ['YoloV5']
-    noises = [0,3,6,9]
+    noises = [0,5,10,15]
     measures = ['Precision','Recall','mAP0.5','mAP0.5:0.95']
     measures_save = ['Precision','Recall','mAP0.5','mAP']
     mp_list = []
