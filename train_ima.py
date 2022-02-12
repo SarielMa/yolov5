@@ -400,9 +400,9 @@ def classify_model_std_output_reg(l1, l2, l3):# did not apply for this experimen
     return Yp_e_Y
 #
 def classify_model_adv_output_reg(l1, l2, l3):
-    t1 = 0.0440244084744878
-    t2 = 0.049166801575797725
-    t3 = 0.010525250147504777
+    t1 = 0.03965024
+    t2 = 0.060259447
+    t3 = 0.04034234
     Yp_e_Y=(l1<=t1)&(l2<=t2)&(l3<=t3)
     return Yp_e_Y
 
@@ -647,9 +647,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     #======================
     
     sample_count_train = len(dataset)
-    noise = 10
+    noise = 15
     #epoch_refine = 100
-    delta = 0.4*noise
+    delta = 2.5
     E = delta*torch.ones(sample_count_train, dtype=torch.float32)
     bottom = delta*torch.ones(sample_count_train, dtype=torch.float32)
     max_iter = 20   
@@ -891,19 +891,19 @@ def parse_opt(known=False):
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
     parser.add_argument('--cache', type=str, nargs='?', const='ram', help='--cache images in "ram" (default) or "disk"')
     parser.add_argument('--image-weights', action='store_true', help='use weighted image selection for training')
-    parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--device', default='1', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--multi-scale', action='store_true', help='vary img-size +/- 50%%')
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
     parser.add_argument('--optimizer', type=str, choices=['SGD', 'Adam', 'AdamW'], default='SGD', help='optimizer')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
     parser.add_argument('--workers', type=int, default=8, help='max dataloader workers (per RANK in DDP mode)')
     parser.add_argument('--project', default=ROOT / 'runs/train_ima', help='save to project/name')
-    parser.add_argument('--name', default='BCCD_ima_L2_d4', help='save to project/name')
+    parser.add_argument('--name', default='BCCD_ima_L2_d2.5', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
     parser.add_argument('--linear-lr', action='store_true', help='linear LR')
     parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing epsilon')
-    parser.add_argument('--patience', type=int, default=100, help='EarlyStopping patience (epochs without improvement)')
+    parser.add_argument('--patience', type=int, default=600, help='EarlyStopping patience (epochs without improvement)')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone=10, first3=0 1 2')
     parser.add_argument('--save-period', type=int, default=-1, help='Save checkpoint every x epochs (disabled if < 1)')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')

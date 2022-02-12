@@ -486,20 +486,21 @@ def main(opt):
 
 if __name__ == "__main__":
     models = ['runs/train/BCCD/weights/last.pt',
-              'runs/train_adv/BCCD_adv_L2_3/weights/last.pt',
-              'runs/train_adv/BCCD_adv_L2_6/weights/last.pt',
-              'runs/train_adv/BCCD_adv_L2_9/weights/last.pt',
-              'runs/train_ima/BCCD_ima_L2_d3/weights/last.pt']
+              'runs/train_adv/BCCD_adv_L2_1/weights/last.pt',
+              'runs/train_adv/BCCD_adv_L2_5/weights/last.pt',
+              'runs/train_adv/BCCD_adv_L2_10/weights/last.pt',
+              'runs/train_adv/BCCD_adv_L2_15/weights/last.pt',
+              'runs/train_ima/BCCD_ima_L2_d5/weights/last.pt']
     
     for p in models:
         assert(os.path.exists(p))
     print('all the models exist!!!!!!!!!!!!!!!!!!!!!')
-    model_names = ['YoloV5', 'adv3','adv6','adv9','IMA'] 
+    model_names = ['YoloV5', 'adv1','adv5','adv10','adv15','IMA'] 
     
     ######################################################
     #models = ['runs/train/BCCD/weights/best.pt']
     #model_names = ['YoloV5']
-    noises = [0,3,6,9]
+    noises = [0,5,10,15]
 
     iou_list = []
 
@@ -520,6 +521,8 @@ if __name__ == "__main__":
 
     plt.title("average IOU")
     plt.ylabel("average IOU")
+    plt.ylim(0,1)
+    plt.yticks(np.arange(0, 1.05, step=0.05))
     plt.xlabel("noise(L2)")
     this_list = all_list[0] # the jth measure list
     for i, n in enumerate(model_names):
