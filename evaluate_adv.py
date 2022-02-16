@@ -492,12 +492,12 @@ if __name__ == "__main__":
               'runs/train_adv/BCCD_adv_L2_5/weights/last.pt',
               'runs/train_adv/BCCD_adv_L2_10/weights/last.pt',
               'runs/train_adv/BCCD_adv_L2_15/weights/last.pt',
-              'runs/train_ima/BCCD_ima_L2_d5/weights/last.pt']
+              'runs/train_ima/BCCD_ima_L2_d2.5/weights/last.pt']
     
     for p in models:
         assert(os.path.exists(p))
     print('all the models exist!!!!!!!!!!!!!!!!!!!!!')
-    model_names = ['YoloV5', 'adv1', 'adv5','adv10','adv15','IMA'] 
+    model_names = ['YoloV5', 'adv1','adv5','adv10','adv15','AMAT']  
     
     ######################################################
     #models = ['runs/train/BCCD/weights/best.pt']
