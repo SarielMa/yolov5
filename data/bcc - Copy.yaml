@@ -1,5 +1,5 @@
 train: bcc/images/train
 val: bcc/images/valid
-test: bcc/images/show
+test: bcc/images/test
 nc: 3 
 names: ['Platelets', 'RBC', 'WBC']

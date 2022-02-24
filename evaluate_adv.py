@@ -451,7 +451,7 @@ def parse_opt(model, noise):
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', type=str, default=ROOT / 'data/bcc.yaml', help='dataset.yaml path')
     parser.add_argument('--weights', nargs='+', type=str, default=ROOT / model, help='model.pt path(s)')
-    parser.add_argument('--batch-size', type=int, default=32, help='batch size')
+    parser.add_argument('--batch-size', type=int, default=1, help='batch size')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=320, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.6, help='NMS IoU threshold')
@@ -483,7 +483,12 @@ def main(opt):
     check_requirements(requirements=ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))
     return run(**vars(opt))
 
-
+def getAUC(ys, xs):
+    ret = 0
+    for i in range(1,len(xs)):
+        h = xs[i]-xs[i-1]
+        ret += 0.5*h*(ys[i-1]+ys[i])
+    return ret
 
 
 if __name__ == "__main__":
@@ -497,7 +502,7 @@ if __name__ == "__main__":
     for p in models:
         assert(os.path.exists(p))
     print('all the models exist!!!!!!!!!!!!!!!!!!!!!')
-    model_names = ['YoloV5', 'adv1','adv5','adv10','adv15','AMAT']  
+    model_names = ['STD', 'SAT1','SAT5','SAT10','SAT15','AMAT']  
     
     ######################################################
     #models = ['runs/train/BCCD/weights/best.pt']
@@ -534,6 +539,8 @@ if __name__ == "__main__":
     for j, m in enumerate(measures):
         plt.title(measures[j])
         plt.ylabel(measures[j])
+        plt.ylim(0,1)
+        plt.yticks(np.arange(0, 1.05, step=0.05))
         plt.xlabel("noise(L2)")
         this_list = all_list[j] # the jth measure list
         for i, n in enumerate(model_names):
@@ -544,3 +551,9 @@ if __name__ == "__main__":
         plt.clf()
         
     
+    import csv
+    fields1 = ["noise"]+[str(i) for i in noises]+["AUC"]
+    with open("avIOU result.csv",'w') as csvfile:
+        csvwriter = csv.writer(csvfile)
+        csvwriter.writerow(fields1)
+        csvwriter.writerows(iou_list)

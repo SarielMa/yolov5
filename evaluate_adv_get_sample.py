@@ -225,59 +225,6 @@ def process_batch(detections, labels, iouv):
         correct[matches[:, 1].long()] = matches[:, 2:3] >= iouv
     return correct
 
-def get_sample_iou_old(detections, labels):
-    """
-    Return correct predictions matrix. Both sets of boxes are in (x1, y1, x2, y2) format.
-    Arguments:
-        detections (Array[N, 6]), x1, y1, x2, y2, conf, class
-        labels (Array[M, 5]), class, x1, y1, x2, y2
-    Returns:
-        matches, including all the ious
-    """
-
-    iou = box_iou(labels[:, 1:], detections[:, :4])
-    x = torch.where((iou >= 0.5) &(labels[:, 0:1] == detections[:, 5]))  #classes match
-    matches = np.array([])
-    if x[0].shape[0]:
-        matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detection, iou]
-        if x[0].shape[0] > 1:
-            matches = matches[matches[:, 2].argsort()[::-1]]
-            matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-            # matches = matches[matches[:, 2].argsort()[::-1]]
-            matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-    detected = len(matches)
-    to_detect = labels.size(0)-detected
-    if detected>0:
-        return np.pad(matches[:,2],[0,to_detect])
-    else: 
-        return np.zeros(to_detect)
-    
-def get_sample_iou(detections, labels):
-    """
-    Return correct predictions matrix. Both sets of boxes are in (x1, y1, x2, y2) format.
-    Arguments:
-        detections (Array[N, 6]), x1, y1, x2, y2, conf, class
-        labels (Array[M, 5]), class, x1, y1, x2, y2
-    Returns:
-        matches, including all the ious
-    """
-
-    iou = box_iou(labels[:, 1:], detections[:, :4])
-    x = torch.where((labels[:, 0:1] == detections[:, 5]))  #classes match
-    matches = np.array([])
-    if x[0].shape[0]:
-        matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detection, iou]
-        if x[0].shape[0] > 1:
-            matches = matches[matches[:, 2].argsort()[::-1]]
-            matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-            # matches = matches[matches[:, 2].argsort()[::-1]]
-            matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-    detected = len(matches)
-    to_detect = labels.size(0)-detected
-    if detected>0:
-        return np.pad(matches[:,2],[0,to_detect])
-    else: 
-        return np.zeros(to_detect)
 
 @torch.no_grad()
 def run(data,
@@ -379,7 +326,7 @@ def run(data,
 
     compute_loss = ComputeLoss(model.model)
     
-    res = []
+    
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
         t1 = time_sync()
         if pt or jit or engine:
@@ -414,7 +361,6 @@ def run(data,
         dt[2] += time_sync() - t3
 
         # Metrics
-        
         for si, pred in enumerate(out):
             labels = targets[targets[:, 0] == si, 1:]
             nl = len(labels)
@@ -434,25 +380,81 @@ def run(data,
             scale_coords(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
 
             # Evaluate
-            
-            tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
-            scale_coords(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
-            labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
-            res.append( get_sample_iou(predn, labelsn))
-            
-    return np.concatenate(res).mean()
-            
+            if nl:
+                tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
+                scale_coords(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
+                labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
+                correct = process_batch(predn, labelsn, iouv)
+                if plots:
+                    confusion_matrix.process_batch(predn, labelsn)
+            else:
+                correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool)
+            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))  # (correct, conf, pcls, tcls)
 
+            # Save/log
+            if save_txt:
+                save_one_txt(predn, save_conf, shape, file=save_dir / 'labels' / (path.stem + '.txt'))
+            if save_json:
+                save_one_json(predn, jdict, path, class_map)  # append to COCO-JSON dictionary
+            callbacks.run('on_val_image_end', pred, predn, path, names, im[si])
+
+        # Plot images
+        if plots and batch_i < 3:
+            f = save_dir / f'val_batch{batch_i}_labels.jpg'  # labels
+            Thread(target=plot_images, args=(im, targets, paths, f, names), daemon=True).start()
+            f = save_dir / f'val_batch{batch_i}_pred.jpg'  # predictions
+            Thread(target=plot_images, args=(im, output_to_target(out), paths, f, names), daemon=True).start()
+
+    # Compute metrics
+    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
+    if len(stats) and stats[0].any():
+        tp, fp, p, r, f1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
+        ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
+        mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
+        nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
+    else:
+        nt = torch.zeros(1)
+
+    # Print results
+    pf = '%20s' + '%11i' * 2 + '%11.3g' * 4  # print format
+    LOGGER.info(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
+
+    # Print results per class
+    if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
+        for i, c in enumerate(ap_class):
+            LOGGER.info(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
+
+    # Print speeds
+    t = tuple(x / seen * 1E3 for x in dt)  # speeds per image
+    if not training:
+        shape = (batch_size, 3, imgsz, imgsz)
+        LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {shape}' % t)
+
+    # Plots
+    if plots:
+        confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
+        callbacks.run('on_val_end')
+
+    # Return results
+    model.float()  # for training
+    if not training:
+        s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
+        LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
+    maps = np.zeros(nc) + map
+    for i, c in enumerate(ap_class):
+        maps[c] = ap[i]
+    #return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
+    return mp, mr, map50, map
 
 
 def parse_opt(model, noise):
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', type=str, default=ROOT / 'data/bcc.yaml', help='dataset.yaml path')
     parser.add_argument('--weights', nargs='+', type=str, default=ROOT / model, help='model.pt path(s)')
-    parser.add_argument('--batch-size', type=int, default=32, help='batch size')
+    parser.add_argument('--batch-size', type=int, default=1, help='batch size')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=320, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.5, help='NMS IoU threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.6, help='NMS IoU threshold')
     parser.add_argument('--task', default='test', help='train, val, test, speed or study')
     parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--workers', type=int, default=8, help='max dataloader workers (per RANK in DDP mode)')
@@ -481,13 +483,13 @@ def main(opt):
     check_requirements(requirements=ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))
     return run(**vars(opt))
 
-
 def getAUC(ys, xs):
     ret = 0
     for i in range(1,len(xs)):
         h = xs[i]-xs[i-1]
         ret += 0.5*h*(ys[i-1]+ys[i])
     return ret
+
 
 if __name__ == "__main__":
     models = ['runs/train/BCCD/weights/last.pt',
@@ -500,48 +502,38 @@ if __name__ == "__main__":
     for p in models:
         assert(os.path.exists(p))
     print('all the models exist!!!!!!!!!!!!!!!!!!!!!')
-    model_names = ['STD', 'SAT1','SAT5','SAT10','SAT15','AMAT'] 
+    model_names = ['STD', 'SAT1','SAT5','SAT10','SAT15','AMAT']  
     
     ######################################################
     #models = ['runs/train/BCCD/weights/best.pt']
     #model_names = ['YoloV5']
     noises = [0,5,10,15]
-
-    iou_list = []
-
+    measures = ['Precision','Recall','mAP0.5','mAP0.5:0.95']
+    measures_save = ['Precision','Recall','mAP0.5','mAP']
+    mp_list = []
+    mr_list = []
+    map50_list = []
+    map_list = []
     for i, model in enumerate(models):
-        one_method = [model_names[i]]     
+        one_method_mp = [model_names[i]]
+        one_method_mr = [model_names[i]]
+        one_method_map50 = [model_names[i]]
+        one_method_map = [model_names[i]]
+        
         for n in noises:
             opt = parse_opt(model, n)
-            iou = main(opt)
-            one_method.append(iou)
-        #calculate the AUC
-        auc = getAUC(one_method[1:], noises)
-        one_method = one_method+[str(auc)]
-        iou_list.append(one_method)
-
+            mp, mr, mAP50, mAP = main(opt)
+            one_method_mp.append(mp)
+            one_method_mr.append(mr)
+            one_method_map50.append(mAP50)
+            one_method_map.append(mAP)
+        mp_list.append(one_method_mp)
+        mr_list.append(one_method_mr)
+        map50_list.append(one_method_map50)
+        map_list.append(one_method_map)
    
-    all_list = [iou_list]
+    all_list = [mp_list, mr_list, map50_list, map_list]
     
-    import matplotlib.pyplot as plt
-    color = ['r','b','g','y','m','c','k']
 
-    plt.title("average IOU")
-    plt.ylabel("average IOU")
-    plt.ylim(0,1)
-    plt.yticks(np.arange(0, 1.05, step=0.05))
-    plt.xlabel("noise(L2)")
-    this_list = all_list[0] # the jth measure list
-    for i, n in enumerate(model_names):
-        plt.plot(noises, this_list[i][1:5], color = color[i], label = model_names[i])
-    plt.legend()
-    plt.grid(True)
-    plt.savefig("avIOU result.pdf",bbox_inches='tight')
-    plt.clf()
         
-    import csv
-    fields1 = ["noise"]+[str(i) for i in noises]+["AUC"]
-    with open("avIOU result.csv",'w') as csvfile:
-        csvwriter = csv.writer(csvfile)
-        csvwriter.writerow(fields1)
-        csvwriter.writerows(iou_list) 
+    
