@@ -1,9 +1,5 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sun Jan 30 19:25:11 2022
 
-@author: linhai
-"""
+
 
 import os, sys, random, shutil
 import xml.etree.ElementTree as ET

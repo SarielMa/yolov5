@@ -307,10 +307,24 @@ def run(weights=ROOT / 'runs/train/BCCD2/weights/best.pt',  # model.pt path(s)
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+            
+            #assign targets to det
+            """
+            det[:,:4] = targets[:,2:]
+            det[:,4] = targets[:,0]
+            
+            """
+            h = im0.shape[0]
+            w = im0.shape[1]
+            det[:,5] = targets[:,1]
+            det[:,0] = (targets[:,2]-0.5*targets[:,4])*w
+            det[:,2] = (targets[:,2]+0.5*targets[:,4])*w
+            det[:,1] = (targets[:,3]-0.5*targets[:,5])*h
+            det[:,3] = (targets[:,3]+0.5*targets[:,5])*h
             if len(det):
                 # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
-
+                #det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
+                #det[:, :4] = scale_coords([1,1], det[:, :4], im0.shape).round()
                 # Print results
                 for c in det[:, -1].unique():
                     n = (det[:, -1] == c).sum()  # detections per class
@@ -322,7 +336,7 @@ def run(weights=ROOT / 'runs/train/BCCD2/weights/best.pt',  # model.pt path(s)
 
                     if save_img or save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
-                        label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
+                        label = None if hide_labels else (names[c])
                         annotator.box_label(xyxy, label, color=colors(c, True))
                         if save_crop:
                             save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.png', BGR=True)
@@ -412,7 +426,7 @@ if __name__ == "__main__":
     ######################################################
     #models = ['runs/train/BCCD/weights/best.pt']
     #model_names = ['YoloV5']
-    noises = [0,5,10,15]
+    noises = [0]
     #noises = [15]
 
 
